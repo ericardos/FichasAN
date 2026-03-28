@@ -1,6 +1,10 @@
 import React, { useState, useRef, useEffect } from "react";
 import { Upload, FileText, Table, CheckCircle2, AlertCircle, Loader2, Download, Heart, Copy, X, Sparkles } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import * as XLSX from "xlsx";
+import PizZip from "pizzip";
+import Docxtemplater from "docxtemplater";
+import JSZip from "jszip";
 
 export default function App() {
   const [files, setFiles] = useState<{
@@ -40,39 +44,132 @@ export default function App() {
     }
 
     setStatus("processing");
-    setMessage("Processando seus documentos...");
-
-    const formData = new FormData();
-    formData.append("capa", files.capa);
-    formData.append("ficha", files.ficha);
-    formData.append("xlsx", files.xlsx);
+    setMessage("Lendo e processando arquivos localmente...");
 
     try {
-      const response = await fetch("/api/gerar", {
-        method: "POST",
-        body: formData,
-      });
+      // 1. Ler os arquivos como ArrayBuffers
+      const [capaBuf, fichaBuf, xlsxBuf] = await Promise.all([
+        files.capa.arrayBuffer(),
+        files.ficha.arrayBuffer(),
+        files.xlsx.arrayBuffer()
+      ]);
 
-      if (!response.ok) {
-        let errorMessage = "Erro ao processar arquivos.";
-        try {
-          const errorData = await response.json();
-          errorMessage = errorData.error || errorData.details || errorMessage;
-        } catch (e) {
-          errorMessage = `Erro do servidor (${response.status}): ${response.statusText}`;
-        }
-        throw new Error(errorMessage);
+      // 2. Processar Excel
+      const workbook = XLSX.read(new Uint8Array(xlsxBuf), { type: "array" });
+      const sheets = workbook.SheetNames;
+
+      if (!sheets.includes("PARECERES")) {
+        throw new Error("Aba 'PARECERES' não encontrada na planilha Excel.");
       }
 
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
+      const sheetPareceres = XLSX.utils.sheet_to_json(workbook.Sheets["PARECERES"]) as any[];
+      const mapaParecer: Record<string, string> = {};
+      
+      sheetPareceres.forEach(row => {
+        const normalizedRow: any = {};
+        Object.keys(row).forEach(key => {
+          const normKey = key.trim().toLowerCase()
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+            .replace(/ç/g, "c");
+          normalizedRow[normKey] = row[key];
+        });
+        if (normalizedRow.codigo !== undefined && normalizedRow.texto !== undefined) {
+          mapaParecer[String(normalizedRow.codigo).trim()] = String(normalizedRow.texto).trim();
+        }
+      });
+
+      const resultsZip = new JSZip();
+      let totalFichas = 0;
+
+      // Função para renderizar Word no navegador
+      const renderDoc = (content: ArrayBuffer, data: any) => {
+        const zip = new PizZip(content);
+        const doc = new Docxtemplater(zip, {
+          delimiters: { start: "<<", end: ">>" },
+          paragraphLoop: true,
+          linebreaks: true,
+        });
+        doc.render(data);
+        return doc.getZip().generate({ type: "blob" });
+      };
+
+      // 3. Processar cada aba/turma
+      for (const sheetName of sheets) {
+        if (sheetName === "PARECERES") continue;
+
+        const rawData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" }) as any[];
+        if (rawData.length === 0) continue;
+
+        const safeTurmaName = sheetName.replace(/[^a-zA-Z0-9]/g, "_") || "Turma_Sem_Nome";
+        const turmaFolder = resultsZip.folder(safeTurmaName);
+
+        // Capa da Turma
+        try {
+          const capaBlob = renderDoc(capaBuf, {
+            TURMA: sheetName,
+            TURNO: String(rawData[0].turno || rawData[0].Turno || "").trim()
+          });
+          turmaFolder?.file("00_CAPA_DA_TURMA.docx", capaBlob);
+        } catch (e: any) {
+          console.error(`Erro na capa da turma ${sheetName}:`, e.message);
+        }
+
+        // Fichas dos Alunos
+        for (let i = 0; i < rawData.length; i++) {
+          const row = rawData[i];
+          const normalizedRow: any = {};
+          Object.keys(row).forEach(key => {
+            const normKey = key.trim().toLowerCase()
+              .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+              .replace(/ç/g, "c");
+            normalizedRow[normKey] = row[key];
+          });
+
+          const nome = String(normalizedRow.nomealuno || normalizedRow.nome || "").trim();
+          if (!nome) continue;
+
+          const codParecer = String(normalizedRow.parecer || "").trim();
+          const parecerLongText = mapaParecer[codParecer] || codParecer;
+          const conceito = String(normalizedRow.parecertexto || normalizedRow.conceito || "").trim();
+          const turno = String(normalizedRow.turno || "").trim();
+
+          try {
+            const fichaBlob = renderDoc(fichaBuf, {
+              NOME: nome,
+              PARECER: parecerLongText,
+              CONCEITO: conceito,
+              TURMA: sheetName,
+              TURNO: turno
+            });
+            
+            const safeNome = nome.replace(/[^a-zA-Z0-9]/g, "_") || `Aluno_${i + 1}`;
+            turmaFolder?.file(`${safeNome}.docx`, fichaBlob);
+            totalFichas++;
+          } catch (e: any) {
+            console.error(`Erro na ficha do aluno ${nome}:`, e.message);
+          }
+        }
+      }
+
+      if (totalFichas === 0) {
+        throw new Error("Nenhum dado de aluno encontrado nas planilhas.");
+      }
+
+      setMessage("Gerando arquivo ZIP final...");
+      const zipBlob = await resultsZip.generateAsync({ 
+        type: "blob",
+        compression: "STORE"
+      });
+      
+      const url = window.URL.createObjectURL(zipBlob);
       setDownloadUrl(url);
       setStatus("success");
-      setMessage("Seus documentos foram gerados com sucesso!");
+      setMessage(`Sucesso! ${totalFichas} fichas foram geradas.`);
+
     } catch (error: any) {
-      console.error("Erro na geração:", error);
+      console.error("Erro no processamento client-side:", error);
       setStatus("error");
-      setMessage(error.message || "Erro de conexão com o servidor.");
+      setMessage(error.message || "Erro inesperado ao processar arquivos.");
     }
   };
 
