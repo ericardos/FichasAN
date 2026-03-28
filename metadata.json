@@ -1,0 +1,5 @@
+{
+  "name": "Gerador de Fichas Escolares",
+  "description": "Gere fichas de alunos em PDF a partir de modelos Word e planilhas Excel.",
+  "requestFramePermissions": []
+}
