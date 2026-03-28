@@ -373,7 +373,7 @@ export default function App() {
             <Sparkles className="w-4 h-4" />
             FICHAS.IO
           </div>
-          <p className="text-sm">Desenvolvido para facilitar a vida de educadores • 2026</p>
+          <p className="text-sm">Desenvolvido para facilitar a vida de educadores • v2.0 (Offline Mode) • 2026</p>
           <button 
             onClick={() => setShowPixModal(true)}
             className="flex items-center gap-2 text-sm font-bold text-amber-600 hover:text-amber-700 transition-colors"
