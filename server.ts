@@ -19,19 +19,24 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  const uploadDir = path.join(process.cwd(), "uploads");
+  const uploadDir = path.join("/tmp", "fichas-uploads");
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
   }
 
-  const upload = multer({ dest: "uploads/" });
+  const upload = multer({ dest: uploadDir });
+
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
 
   // Health check
   app.get("/api/health", (req, res) => {
+    console.log("Health check requested");
     res.json({ status: "ok" });
   });
 
   // API routes
+  console.log("Registering API routes...");
   app.post("/api/gerar", upload.fields([
     { name: "capa", maxCount: 1 },
     { name: "ficha", maxCount: 1 },
@@ -167,19 +172,14 @@ async function startServer() {
       console.log(`Gerando arquivo ZIP com ${totalFichas} fichas...`);
       const zipContent = await resultsZip.generateAsync({ 
         type: "nodebuffer",
-        compression: "DEFLATE",
-        compressionOptions: { level: 6 }
+        compression: "STORE"
       });
       
       console.log(`ZIP gerado com sucesso. Tamanho: ${(zipContent.length / 1024).toFixed(2)} KB`);
 
-      res.set({
-        "Content-Type": "application/zip",
-        "Content-Disposition": `attachment; filename="fichas_${Date.now()}.zip"`,
-        "Content-Length": zipContent.length
-      });
-      
-      res.end(zipContent);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.attachment(`fichas_${Date.now()}.zip`);
+      res.send(zipContent);
       console.log("ZIP enviado com sucesso!");
 
     } catch (error: any) {
@@ -202,17 +202,26 @@ async function startServer() {
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
+    console.log("Starting in DEVELOPMENT mode");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
+    console.log("Starting in PRODUCTION mode");
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    } else {
+      console.error("DIST folder not found! Did you run 'npm run build'?");
+      app.get("*", (req, res) => {
+        res.status(500).send("Server Error: Static files not found. Please run build.");
+      });
+    }
   }
 
   app.listen(PORT, "0.0.0.0", () => {
