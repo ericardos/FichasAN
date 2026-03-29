@@ -22,6 +22,7 @@ export default function App() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [showPixModal, setShowPixModal] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [singleFilePerTurma, setSingleFilePerTurma] = useState(true);
 
   const pixKey = "fdf03993-fbdd-4b89-be41-6e63d2352729";
 
@@ -93,6 +94,40 @@ export default function App() {
         return doc.getZip().generate({ type: "blob" });
       };
 
+      // Função "Super Loop" - Repete o conteúdo do documento para cada aluno
+      // Isso evita o erro de "letras vermelhas" pois não há união de arquivos externos
+      const renderSuperLoop = (content: ArrayBuffer, studentsData: any[]) => {
+        const zip = new PizZip(content);
+        let xml = zip.file("word/document.xml").asText();
+        
+        // Estratégia robusta: Localiza o corpo e as propriedades da seção final
+        const bodyStartIdx = xml.indexOf("<w:body>");
+        const lastSectPrIdx = xml.lastIndexOf("<w:sectPr");
+        
+        if (bodyStartIdx !== -1 && lastSectPrIdx !== -1 && lastSectPrIdx > bodyStartIdx) {
+          const prefix = xml.substring(0, bodyStartIdx + 8);
+          const mainContent = xml.substring(bodyStartIdx + 8, lastSectPrIdx);
+          const suffix = xml.substring(lastSectPrIdx);
+          
+          // Envolve o conteúdo principal no loop e adiciona quebra de página
+          // Usamos os delimitadores << >> do usuário, mas envelopados em XML válido
+          // CRITICAL: Escapamos os caracteres < e > para não quebrar o XML
+          const loopStart = '<w:p><w:r><w:t>&lt;&lt;#_fichas&gt;&gt;</w:t></w:r></w:p>';
+          const loopEnd = '<w:p><w:r><w:br w:type="page"/><w:t>&lt;&lt;/_fichas&gt;&gt;</w:t></w:r></w:p>';
+          xml = `${prefix}${loopStart}${mainContent}${loopEnd}${suffix}`;
+          zip.file("word/document.xml", xml);
+        }
+        
+        const doc = new Docxtemplater(zip, {
+          delimiters: { start: "<<", end: ">>" },
+          paragraphLoop: true,
+          linebreaks: true,
+        });
+        
+        doc.render({ _fichas: studentsData });
+        return doc.getZip().generate({ type: "blob" });
+      };
+
       // 3. Processar cada aba/turma
       for (const sheetName of sheets) {
         if (sheetName === "PARECERES") continue;
@@ -102,19 +137,10 @@ export default function App() {
 
         const safeTurmaName = sheetName.replace(/[^a-zA-Z0-9]/g, "_") || "Turma_Sem_Nome";
         const turmaFolder = resultsZip.folder(safeTurmaName);
+        
+        const studentsList: any[] = [];
 
-        // Capa da Turma
-        try {
-          const capaBlob = renderDoc(capaBuf, {
-            TURMA: sheetName,
-            TURNO: String(rawData[0].turno || rawData[0].Turno || "").trim()
-          });
-          turmaFolder?.file("00_CAPA_DA_TURMA.docx", capaBlob);
-        } catch (e: any) {
-          console.error(`Erro na capa da turma ${sheetName}:`, e.message);
-        }
-
-        // Fichas dos Alunos
+        // Preparar dados de todos os alunos
         for (let i = 0; i < rawData.length; i++) {
           const row = rawData[i];
           const normalizedRow: any = {};
@@ -133,20 +159,86 @@ export default function App() {
           const conceito = String(normalizedRow.parecertexto || normalizedRow.conceito || "").trim();
           const turno = String(normalizedRow.turno || "").trim();
 
+          const studentData = {
+            NOME: nome,
+            PARECER: parecerLongText,
+            CONCEITO: conceito,
+            TURMA: sheetName,
+            TURNO: turno
+          };
+
+          if (singleFilePerTurma) {
+            studentsList.push(studentData);
+          } else {
+            try {
+              const fichaBlob = renderDoc(fichaBuf, studentData);
+              const safeNome = nome.replace(/[^a-zA-Z0-9]/g, "_") || `Aluno_${i + 1}`;
+              turmaFolder?.file(`${safeNome}.docx`, fichaBlob);
+            } catch (e: any) {
+              console.error(`Erro na ficha do aluno ${nome}:`, e.message);
+            }
+          }
+          totalFichas++;
+        }
+
+        // Se for arquivo único, usar a estratégia Super Loop + Capa
+        if (singleFilePerTurma && studentsList.length > 0) {
           try {
-            const fichaBlob = renderDoc(fichaBuf, {
-              NOME: nome,
-              PARECER: parecerLongText,
-              CONCEITO: conceito,
-              TURMA: sheetName,
-              TURNO: turno
-            });
+            // 1. Gera um único documento com todas as fichas
+            const allFichasBlob = renderSuperLoop(fichaBuf, studentsList);
             
-            const safeNome = nome.replace(/[^a-zA-Z0-9]/g, "_") || `Aluno_${i + 1}`;
-            turmaFolder?.file(`${safeNome}.docx`, fichaBlob);
-            totalFichas++;
+            // 2. Gera a capa
+            const capaBlob = renderDoc(capaBuf, {
+              TURMA: sheetName,
+              TURNO: String(rawData[0].turno || rawData[0].Turno || "").trim()
+            });
+
+            // 3. Une APENAS a Capa com o blocão de fichas
+            // @ts-ignore
+            const DocxMergerModule = await import("docx-merger");
+            const DocxMerger = DocxMergerModule.default || DocxMergerModule;
+            
+            const merger = new DocxMerger({ pageBreak: true }, [
+              await capaBlob.arrayBuffer(), 
+              await allFichasBlob.arrayBuffer()
+            ]);
+            
+            await new Promise((resolve, reject) => {
+              merger.save("blob", (blob: Blob) => {
+                turmaFolder?.file(`DOCUMENTO_UNICO_${safeTurmaName}.docx`, blob);
+                resolve(true);
+              }, (err: any) => reject(err));
+            });
+          } catch (error: any) {
+            console.error("Erro ao gerar arquivo único, tentando fallback individual:", error);
+            // FALLBACK: Se a união falhar, gera os arquivos individuais para não travar o usuário
+            try {
+              const capaBlob = renderDoc(capaBuf, {
+                TURMA: sheetName,
+                TURNO: String(rawData[0].turno || rawData[0].Turno || "").trim()
+              });
+              turmaFolder?.file("00_CAPA_DA_TURMA.docx", capaBlob);
+
+              for (let i = 0; i < studentsList.length; i++) {
+                const s = studentsList[i];
+                const fBlob = renderDoc(fichaBuf, s);
+                const sNome = s.NOME.replace(/[^a-zA-Z0-9]/g, "_") || `Aluno_${i + 1}`;
+                turmaFolder?.file(`${sNome}.docx`, fBlob);
+              }
+            } catch (fallbackError) {
+              console.error("Erro no fallback:", fallbackError);
+            }
+          }
+        } else if (!singleFilePerTurma) {
+          // Gerar capa individual se não for arquivo único
+          try {
+            const capaBlob = renderDoc(capaBuf, {
+              TURMA: sheetName,
+              TURNO: String(rawData[0].turno || rawData[0].Turno || "").trim()
+            });
+            turmaFolder?.file("00_CAPA_DA_TURMA.docx", capaBlob);
           } catch (e: any) {
-            console.error(`Erro na ficha do aluno ${nome}:`, e.message);
+            console.error(`Erro na capa da turma ${sheetName}:`, e.message);
           }
         }
       }
@@ -277,7 +369,22 @@ export default function App() {
                       <Upload className="w-8 h-8 text-slate-400" />
                     </div>
                     <h2 className="text-2xl font-bold text-[#0F172A] mb-4">Pronto para começar?</h2>
-                    <p className="text-slate-500 mb-10 max-w-xs">Selecione os arquivos acima para habilitar a geração dos documentos.</p>
+                    <p className="text-slate-500 mb-6 max-w-xs">Selecione os arquivos acima para habilitar a geração dos documentos.</p>
+                    
+                    {/* Toggle Option */}
+                    <div className="flex items-center gap-3 mb-10 bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                      <div 
+                        onClick={() => setSingleFilePerTurma(!singleFilePerTurma)}
+                        className={`w-12 h-6 rounded-full relative cursor-pointer transition-colors ${singleFilePerTurma ? 'bg-amber-500' : 'bg-slate-300'}`}
+                      >
+                        <motion.div 
+                          animate={{ x: singleFilePerTurma ? 24 : 4 }}
+                          className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                        />
+                      </div>
+                      <span className="text-sm font-bold text-slate-600">Arquivo Único por Turma</span>
+                    </div>
+
                     <button
                       onClick={handleGenerate}
                       disabled={!files.capa || !files.ficha || !files.xlsx}
@@ -373,7 +480,7 @@ export default function App() {
             <Sparkles className="w-4 h-4" />
             FICHAS.IO
           </div>
-          <p className="text-sm">Desenvolvido para facilitar a vida de educadores • v2.0 (Offline Mode) • 2026</p>
+          <p className="text-sm">Desenvolvido para facilitar a vida de educadores • v2.7 (Super Loop Stable) • 2026</p>
           <button 
             onClick={() => setShowPixModal(true)}
             className="flex items-center gap-2 text-sm font-bold text-amber-600 hover:text-amber-700 transition-colors"
